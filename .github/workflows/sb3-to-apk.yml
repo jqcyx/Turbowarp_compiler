@@ -1,0 +1,75 @@
+name: SB3 to APK Build
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Android 包名 (例如: com.yourname.game)'
+        required: true
+        type: string
+      app_name:
+        description: '应用名称 (例如: MyScratchGame)'
+        required: true
+        type: string
+      sb3_filename:
+        description: '项目中 .sb3 文件名 (例如: game.sb3)'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Node.js 环境
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 Turbowarp Packager
+        run: npm install -g turbowarp-packager
+
+      - name: 🔄 SB3 → HTML
+        run: |
+          mkdir -p dist
+          turbowarp-packager "project/${{ inputs.sb3_filename }}" --output dist/index.html --html
+
+      - name: 设置 JDK 17 (Android 构建必需)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: 设置 Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: 33
+          build-tools: '33.0.0'
+          target: 'android-33'
+
+      - name: 安装 Cordova
+        run: npm install -g cordova@12.0.0
+
+      - name: 初始化 Cordova 项目
+        run: |
+          cordova create cordova_build "${{ inputs.package_name }}" "${{ inputs.app_name }}"
+          cd cordova_build
+          cordova platform add android@12.0.1
+
+      - name: 部署 HTML 到 Cordova
+        run: |
+          rm -rf cordova_build/www/*
+          cp -r dist/* cordova_build/www/
+
+      - name: 构建 APK
+        run: |
+          cd cordova_build
+          cordova build android --release -- --packageType=apk
+
+      - name: 📦 上传 APK 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.app_name }}-APK
+          path: cordova_build/platforms/android/app/build/outputs/apk/release/app-release.apk
+          retention-days: 30
