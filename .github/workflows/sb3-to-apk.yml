@@ -45,6 +45,9 @@ jobs:
           if [ ! -d "${TURBOWARP_DIR}" ]; then
             git clone https://github.com/TurboWarp/packager.git "${TURBOWARP_DIR}"
           fi
+          # 确保仓库是最新版本
+          cd "${TURBOWARP_DIR}"
+          git checkout main && git pull
           ls -la "${TURBOWARP_DIR}"
 
       - name: 设置 Node.js
@@ -54,21 +57,24 @@ jobs:
           cache: 'npm'
           cache-dependency-path: ${{ env.TURBOWARP_DIR }}/package-lock.json
 
-      - name: 构建 Turbowarp 模块（修复：适配官方构建命令）
+      - name: 构建 Turbowarp Node.js 版本（关键修正：用 build-node-prod）
         run: |
           cd "${TURBOWARP_DIR}"
           npm ci
-          npm run build-prod  # 关键修复：官方最新版用 build-prod 替代 build-node-prod
-          # 验证构建产物路径
-          ls -la dist/ && ls -la dist/packager/
+          # 执行 Node.js 专属构建命令（匹配 package.json 中的脚本）
+          npm run build-node-prod
+          # 验证构建产物（此时产物是 dist/packager.js 单文件）
+          ls -la dist/ && ls -la dist/packager.js || echo "packager.js 不存在"
 
-      - name: 生成转换脚本（修复：修正模块引入路径）
+      - name: 生成转换脚本（关键修正：适配单文件入口 + 完整 Node.js 适配）
         run: |
           cat > "${TURBOWARP_DIR}/convert-sb3.js" << 'EOF'
           const fs = require('fs');
           const path = require('path');
-          // 关键修复：修正 Node.js 模块引入路径（官方产物在 dist/packager）
+          // 修正1：引入单文件入口 dist/packager.js
           const Packager = require('./dist/packager');
+          // 修正2：引入 Node.js 适配器（必须，否则无法在 Node.js 环境运行）
+          const NodeAdapter = require('./src/packager/node/adapter').default;
 
           // 环境变量传入的参数
           const sb3Path = process.env.SB3_PATH;
@@ -76,35 +82,49 @@ jobs:
 
           // 核心转换逻辑
           const run = async () => {
-            // 创建输出目录
+            // 步骤1：设置 Node.js 适配器（Turbowarp 必须）
+            Packager.setAdapter(new NodeAdapter());
+
+            // 步骤2：创建输出目录
             fs.mkdirSync(path.dirname(outputHtmlPath), { recursive: true });
             
-            // 读取 SB3 文件
+            // 步骤3：读取 SB3 文件（Node.js 环境读取为 Buffer）
             console.log(`📥 读取 SB3 文件: ${sb3Path}`);
-            const projectData = fs.readFileSync(sb3Path);
+            const projectBuffer = fs.readFileSync(sb3Path);
+            // 转换为 ArrayBuffer（适配 Turbowarp API）
+            const projectArrayBuffer = projectBuffer.buffer.slice(
+              projectBuffer.byteOffset, 
+              projectBuffer.byteOffset + projectBuffer.byteLength
+            );
 
-            // 加载 Scratch 项目（适配官方 API）
+            // 步骤4：加载 Scratch 项目（适配 Turbowarp Node.js API）
             console.log('🔧 加载项目...');
-            const loadedProject = await Packager.loadProject(projectData);
+            const loadedProject = await Packager.loadProject(projectArrayBuffer);
 
-            // 初始化 Turbowarp 打包器
+            // 步骤5：初始化 Turbowarp 打包器
             const packager = new Packager.Packager();
             packager.project = loadedProject;
-            packager.options.target = 'html'; // 指定输出为 HTML
-            packager.options.turbo = true;    // 启用 Turbo 模式优化
+            packager.options = {
+              target: 'html',       // 指定输出为 HTML
+              turbo: true,          // 启用 Turbo 模式优化
+              standalone: true,     // 生成独立 HTML（无外部依赖）
+              compress: true        // 压缩 HTML
+            };
 
-            // 执行打包
+            // 步骤6：执行打包
             console.log('⚙️ 转换 SB3 到 HTML...');
             const result = await packager.package();
 
-            // 处理输出数据（兼容 ArrayBuffer/字符串）
+            // 步骤7：处理输出数据（兼容 ArrayBuffer/Buffer/字符串）
             let htmlData = result.data;
             if (htmlData instanceof ArrayBuffer) {
               htmlData = Buffer.from(htmlData).toString('utf8');
+            } else if (Buffer.isBuffer(htmlData)) {
+              htmlData = htmlData.toString('utf8');
             }
 
-            // 写入 HTML 文件
-            fs.writeFileSync(outputHtmlPath, htmlData);
+            // 步骤8：写入 HTML 文件
+            fs.writeFileSync(outputHtmlPath, htmlData, 'utf8');
             console.log(`✅ HTML 生成完成: ${outputHtmlPath}`);
           };
 
@@ -138,7 +158,9 @@ jobs:
           echo "ANDROID_HOME=/usr/lib/android-sdk" >> $GITHUB_ENV
           echo "PATH=\$PATH:/usr/lib/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_ENV
 
+          # 自动接受 Android 许可证
           yes | sdkmanager --licenses || true
+          # 安装 Android 34 构建工具
           sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
 
       - name: 用 Cordova 打包 HTML 为 APK
@@ -146,19 +168,30 @@ jobs:
           mkdir -p "${CORDOVA_DIR}"
           cd "${CORDOVA_DIR}"
 
+          # 创建 Cordova 项目
           cordova create app ${{ inputs.package_name }} "${{ inputs.app_name }}"
           cd app
 
+          # 添加 Android 平台
           cordova platform add android@12.0.0
 
+          # 替换 Cordova 默认 www 目录为生成的 HTML
           rm -rf www/*
           cp -r "${OUTPUT_HTML_DIR}"/* www/
 
+          # 构建 APK（debug 版本）
           cordova build android --debug
 
+          # 查找并复制 APK 文件
           APK_PATH=$(find platforms/android/app/build/outputs/apk/debug -name "*.apk" | head -1)
-          cp "$APK_PATH" "${CORDOVA_DIR}/${{ inputs.app_name }}_debug.apk"
-          echo "✅ APK 生成完成: ${CORDOVA_DIR}/${{ inputs.app_name }}_debug.apk"
+          if [ -f "$APK_PATH" ]; then
+            cp "$APK_PATH" "${CORDOVA_DIR}/${{ inputs.app_name }}_debug.apk"
+            echo "✅ APK 生成完成: ${CORDOVA_DIR}/${{ inputs.app_name }}_debug.apk"
+          else
+            echo "❌ 未找到生成的 APK 文件"
+            ls -la platforms/android/app/build/outputs/apk/debug/
+            exit 1
+          fi
 
       - name: 上传 APK 产物
         uses: actions/upload-artifact@v4
